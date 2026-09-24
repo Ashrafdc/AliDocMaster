@@ -1415,6 +1415,7 @@ function showTrColVisModal(){
 //     Deploy -> Manage deployments -> edit (pencil) -> New version, so the
 //     same /exec URL picks up the change.
 const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzCWZA_l-FneMe6qM4M9Ijkc5rG4ujmKWgV1iOEko0V3pu2l99o1BWOco924HHa9fqp/exec';
+
 const GAS_ENABLED = !!(APPS_SCRIPT_URL && APPS_SCRIPT_URL.indexOf('YOUR_APPS_SCRIPT_WEB_APP_URL') !== 0);
 
 // Chunking (splitting a value too big for one Sheet cell across extra
@@ -3064,6 +3065,7 @@ async function doLogin(username, password){
   rememberLastProject();
   renderProjectSwitcher();
   await loadAll();
+  startAutoSync();
   return true;
 }
 
@@ -3071,6 +3073,7 @@ function doLogout(){
   currentUser = null;
   try{ sessionStorage.removeItem(SESSION_KEY); }catch(e){}
   applyAuthUI();
+  stopAutoSync();
 }
 
 async function initAuth(){
@@ -3086,6 +3089,7 @@ async function initAuth(){
       rememberLastProject();
       renderProjectSwitcher();
       await loadAll();
+      startAutoSync();
       return;
     }
   }
@@ -3818,6 +3822,10 @@ async function switchProject(newProjectId){
   rememberLastProject();
   renderProjectSwitcher();
   await loadAll();
+  // A different project's registers are unrelated data — clear the
+  // "last seen" cache so auto-sync compares against this project's fresh
+  // values instead of stale ones carried over from the previous project.
+  Object.keys(autoSyncLastRaw).forEach(k=> delete autoSyncLastRaw[k]);
 }
 
 async function loadAll(){
@@ -3970,6 +3978,111 @@ document.getElementById('refreshTrBtn').addEventListener('click', ()=>{
 });
 document.getElementById('refreshRfiBtn').addEventListener('click', ()=>{
   refreshRegister('rfis', 'rfiSaved', 'refreshRfiBtn', (v)=>{ rfis = v; }, renderRfis);
+});
+
+// ---------- LIVE AUTO-SYNC (background polling) ----------
+// Silently re-pulls each register from the shared backend on an interval so
+// entries other people add/edit show up here without the person having to
+// click Refresh themselves. This intentionally does NOT touch anything
+// while: a modal/overlay is open (an Add/Update/Workflow dialog, etc. —
+// swapping data under someone mid-task would be disruptive or could lose
+// unsaved input), or the person is actively typing in a contenteditable
+// register cell or a text input/textarea (so a keystroke in progress is
+// never interrupted). Each store is only re-rendered if its fetched JSON
+// actually differs from what's currently in memory, so an unattended tab
+// doesn't churn the DOM every cycle for no reason.
+const AUTO_SYNC_INTERVAL_MS = 20000;
+let autoSyncTimer = null;
+let autoSyncInFlight = false;
+// Last-seen raw JSON per store, used purely to skip a re-render when
+// nothing actually changed since the previous poll.
+const autoSyncLastRaw = {};
+
+function autoSyncBlocked(){
+  // Any open modal/overlay (Add Document, Workflow detail, Directory,
+  // Storage usage, custom confirm/prompt, file viewer, etc.) blocks a sync
+  // this cycle — they're all appended straight to document.body with a
+  // fixed, full-screen overlay, so this one check catches all of them.
+  if(document.querySelector('.file-viewer-overlay')) return true;
+  if(document.body.children && Array.from(document.body.children).some(el=>{
+    if(el.id==='loginScreen' || el.id==='appMain' || el.id==='noProjectBanner') return false;
+    const style = el.getAttribute('style')||'';
+    return style.indexOf('position:fixed') !== -1 && style.indexOf('inset:0') !== -1;
+  })) return true;
+  // Mid-keystroke in a register cell, form field, or search box — don't
+  // swap data out from under an active edit.
+  const active = document.activeElement;
+  if(active){
+    const tag = (active.tagName||'').toLowerCase();
+    if(tag==='input' || tag==='textarea' || tag==='select') return true;
+    if(active.isContentEditable) return true;
+  }
+  return false;
+}
+
+async function autoSyncTick(){
+  if(autoSyncInFlight) return;
+  if(!currentUser || !currentProjectId) return;
+  if(autoSyncBlocked()) return;
+  autoSyncInFlight = true;
+  try{
+    const jobs = [
+      { key:'documents', apply:(v)=>{ docs = v; }, render: renderDocuments, activeTab:'documents' },
+      { key:'transmittals', apply:(v)=>{ trs = v; }, render: renderTransmittals, activeTab:'transmittals' },
+      { key:'rfis', apply:(v)=>{ rfis = v; }, render: renderRfis, activeTab:'rfis' },
+      { key:'workflows', apply:(v)=>{ workflows = v; }, render: renderWorkflowsTab, activeTab:'workflows' },
+      { key:'rfiWorkflows', apply:(v)=>{ rfiWorkflows = v; }, render: renderRfiWorkflowsTab, activeTab:'workflows' },
+      { key:'workflowTemplates', apply:(v)=>{ workflowTemplates = v; }, render: renderWorkflowsTab, activeTab:'workflows' }
+    ];
+    let dashboardDirty = false;
+    for(const job of jobs){
+      if(autoSyncBlocked()) break; // re-check between awaits — an overlay/edit could start mid-cycle
+      let raw;
+      try{ raw = await storageGet(pKey(job.key)); }catch(e){ continue; }
+      const rawStr = raw==null ? '' : String(raw);
+      if(autoSyncLastRaw[job.key] === rawStr) continue; // unchanged since last poll
+      autoSyncLastRaw[job.key] = rawStr;
+      let parsed;
+      try{ parsed = raw ? JSON.parse(raw) : []; }catch(e){ continue; }
+      job.apply(parsed);
+      // Only re-render a panel that's actually visible right now, or that
+      // feeds the dashboard — an inactive tab's DOM will be rebuilt fresh
+      // the next time the person switches to it via its own tab-click
+      // handler, so there's no need to touch it while hidden.
+      const panelEl = document.getElementById(job.activeTab);
+      if(panelEl && panelEl.classList.contains('active')){
+        job.render();
+      }
+      dashboardDirty = true;
+    }
+    if(dashboardDirty && !autoSyncBlocked()){
+      renderDashboard();
+    }
+  }catch(e){
+    // Silent — this runs unattended in the background; a manual Refresh
+    // button is still available for an explicit, visible retry.
+  }finally{
+    autoSyncInFlight = false;
+  }
+}
+
+function startAutoSync(){
+  if(autoSyncTimer) return;
+  autoSyncTimer = setInterval(autoSyncTick, AUTO_SYNC_INTERVAL_MS);
+}
+function stopAutoSync(){
+  if(autoSyncTimer){ clearInterval(autoSyncTimer); autoSyncTimer = null; }
+  // Clear the "last seen" cache too, so the next start (e.g. after
+  // switching projects or logging back in) always does a real comparison
+  // against fresh data rather than an empty stale state.
+  Object.keys(autoSyncLastRaw).forEach(k=> delete autoSyncLastRaw[k]);
+}
+// Pause polling while the tab isn't visible (saves requests when the tab is
+// backgrounded/minimized) and resume — with an immediate catch-up tick —
+// once it's visible again.
+document.addEventListener('visibilitychange', ()=>{
+  if(document.hidden){ stopAutoSync(); }
+  else if(currentUser && currentProjectId){ startAutoSync(); autoSyncTick(); }
 });
 
 function badge(value, colorMap){
