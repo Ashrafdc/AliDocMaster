@@ -1414,34 +1414,33 @@ function showTrColVisModal(){
 //  6. Whenever you paste in an updated version of the script, redeploy via
 //     Deploy -> Manage deployments -> edit (pencil) -> New version, so the
 //     same /exec URL picks up the change.
-const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxQaaJqQTJVs9dW7xhhPUWyugSLFY7MOwIeWSRG6Q8ckAgUQ0G5r-egVUTu3f-wPIhT/exec';
+const KV_API_URL = '/api/kv';
+const KV_ENABLED = true;
 
-const GAS_ENABLED = !!(APPS_SCRIPT_URL && APPS_SCRIPT_URL.indexOf('YOUR_APPS_SCRIPT_WEB_APP_URL') !== 0);
-
-// Chunking (splitting a value too big for one Sheet cell across extra
-// rows) happens inside the Apps Script itself, next to the data — the
-// script has direct access to the sheet, so it can do that in one
-// server-side round trip instead of the several a chunk-aware client would
-// need. These three functions are the entire client-side surface.
-async function gasGet(key){
-  const res = await fetch(APPS_SCRIPT_URL + '?action=get&key=' + encodeURIComponent(key));
+async function kvGet(key){
+  const res = await fetch(`${KV_API_URL}?action=get&key=${encodeURIComponent(key)}`);
   const data = await res.json();
   if(data && data.error) throw new Error(data.error);
   return (data && 'value' in data) ? data.value : null;
 }
 
-async function gasSet(key, value){
-  // No explicit Content-Type header: this keeps the request a CORS "simple
-  // request" (sent as text/plain), which Apps Script Web Apps need since
-  // they don't handle the OPTIONS preflight a JSON content-type triggers.
-  const res = await fetch(APPS_SCRIPT_URL, { method:'POST', body: JSON.stringify({ action:'set', key, value }) });
+async function kvSet(key, value){
+  const res = await fetch(KV_API_URL, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ action:'set', key, value })
+  });
   const data = await res.json().catch(()=>({}));
   if(data && data.error) throw new Error(data.error);
   return true;
 }
 
-async function gasDelete(key){
-  const res = await fetch(APPS_SCRIPT_URL, { method:'POST', body: JSON.stringify({ action:'delete', key }) });
+async function kvDelete(key){
+  const res = await fetch(KV_API_URL, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ action:'delete', key })
+  });
   const data = await res.json().catch(()=>({}));
   if(data && data.error) throw new Error(data.error);
   return true;
@@ -2260,9 +2259,9 @@ async function googleDriveRemoveFile(path){
 }
 
 async function storageDelete(key){
-  if(GAS_ENABLED){
-    try{ return await gasDelete(key); }
-    catch(e){ console.warn('storageDelete: Google Sheet delete failed for', key, e); /* fall through to local fallback */ }
+  if(KV_ENABLED){
+    try{ return await kvDelete(key); }
+    catch(e){ console.warn('storageDelete: Vercel KV delete failed for', key, e); /* fall through to local fallback */ }
   }
   if(window.storage && typeof window.storage.delete === 'function'){
     try{ await window.storage.delete(key, true); return true; }catch(e){ /* fall through */ }
@@ -3622,23 +3621,23 @@ document.getElementById('projectDirectoryLink').addEventListener('click', (e)=>{
 // (users/roles/organizations/projects) is what actually controls who can see
 // and edit what — shared storage is just the common data store underneath it.
 async function storageGet(key){
-  if(GAS_ENABLED){
-    try{ return await gasGet(key); }
-    catch(e){ console.warn('storageGet: Google Sheet lookup failed for', key, e); /* not available here, fall through */ }
+  if(KV_ENABLED){
+    try{ return await kvGet(key); }
+    catch(e){ console.warn('storageGet: Vercel KV lookup failed for', key, e); }
   }
   if(window.storage && typeof window.storage.get === 'function'){
     try{
       const r = await window.storage.get(key, true);
       return r ? r.value : null;
-    }catch(e){ console.warn('storageGet: window.storage lookup failed for', key, e); /* not available here, fall through */ }
+    }catch(e){}
   }
   try{ return localStorage.getItem('dcr_'+key); }catch(e){ return null; }
 }
 
 async function storageSet(key, value){
-  if(GAS_ENABLED){
-    try{ return await gasSet(key, value); }
-    catch(e){ console.warn('storageSet: Google Sheet write failed for', key, e); /* not available here, fall through */ }
+  if(KV_ENABLED){
+    try{ return await kvSet(key, value); }
+    catch(e){ console.warn('storageSet: Vercel KV write failed for', key, e); /* not available here, fall through */ }
   }
   if(window.storage && typeof window.storage.set === 'function'){
     try{
