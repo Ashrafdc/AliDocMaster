@@ -1414,33 +1414,34 @@ function showTrColVisModal(){
 //  6. Whenever you paste in an updated version of the script, redeploy via
 //     Deploy -> Manage deployments -> edit (pencil) -> New version, so the
 //     same /exec URL picks up the change.
-const KV_API_URL = '/api/kv';
-const KV_ENABLED = true;
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxQaaJqQTJVs9dW7xhhPUWyugSLFY7MOwIeWSRG6Q8ckAgUQ0G5r-egVUTu3f-wPIhT/exec';
 
-async function kvGet(key){
-  const res = await fetch(`${KV_API_URL}?action=get&key=${encodeURIComponent(key)}`);
+const GAS_ENABLED = !!(APPS_SCRIPT_URL && APPS_SCRIPT_URL.indexOf('YOUR_APPS_SCRIPT_WEB_APP_URL') !== 0);
+
+// Chunking (splitting a value too big for one Sheet cell across extra
+// rows) happens inside the Apps Script itself, next to the data — the
+// script has direct access to the sheet, so it can do that in one
+// server-side round trip instead of the several a chunk-aware client would
+// need. These three functions are the entire client-side surface.
+async function gasGet(key){
+  const res = await fetch(APPS_SCRIPT_URL + '?action=get&key=' + encodeURIComponent(key));
   const data = await res.json();
   if(data && data.error) throw new Error(data.error);
   return (data && 'value' in data) ? data.value : null;
 }
 
-async function kvSet(key, value){
-  const res = await fetch(KV_API_URL, {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ action:'set', key, value })
-  });
+async function gasSet(key, value){
+  // No explicit Content-Type header: this keeps the request a CORS "simple
+  // request" (sent as text/plain), which Apps Script Web Apps need since
+  // they don't handle the OPTIONS preflight a JSON content-type triggers.
+  const res = await fetch(APPS_SCRIPT_URL, { method:'POST', body: JSON.stringify({ action:'set', key, value }) });
   const data = await res.json().catch(()=>({}));
   if(data && data.error) throw new Error(data.error);
   return true;
 }
 
-async function kvDelete(key){
-  const res = await fetch(KV_API_URL, {
-    method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ action:'delete', key })
-  });
+async function gasDelete(key){
+  const res = await fetch(APPS_SCRIPT_URL, { method:'POST', body: JSON.stringify({ action:'delete', key }) });
   const data = await res.json().catch(()=>({}));
   if(data && data.error) throw new Error(data.error);
   return true;
@@ -2259,9 +2260,9 @@ async function googleDriveRemoveFile(path){
 }
 
 async function storageDelete(key){
-  if(KV_ENABLED){
-    try{ return await kvDelete(key); }
-    catch(e){ console.warn('storageDelete: Vercel KV delete failed for', key, e); /* fall through to local fallback */ }
+  if(GAS_ENABLED){
+    try{ return await gasDelete(key); }
+    catch(e){ console.warn('storageDelete: Google Sheet delete failed for', key, e); /* fall through to local fallback */ }
   }
   if(window.storage && typeof window.storage.delete === 'function'){
     try{ await window.storage.delete(key, true); return true; }catch(e){ /* fall through */ }
@@ -3621,23 +3622,23 @@ document.getElementById('projectDirectoryLink').addEventListener('click', (e)=>{
 // (users/roles/organizations/projects) is what actually controls who can see
 // and edit what — shared storage is just the common data store underneath it.
 async function storageGet(key){
-  if(KV_ENABLED){
-    try{ return await kvGet(key); }
-    catch(e){ console.warn('storageGet: Vercel KV lookup failed for', key, e); }
+  if(GAS_ENABLED){
+    try{ return await gasGet(key); }
+    catch(e){ console.warn('storageGet: Google Sheet lookup failed for', key, e); /* not available here, fall through */ }
   }
   if(window.storage && typeof window.storage.get === 'function'){
     try{
       const r = await window.storage.get(key, true);
       return r ? r.value : null;
-    }catch(e){}
+    }catch(e){ console.warn('storageGet: window.storage lookup failed for', key, e); /* not available here, fall through */ }
   }
   try{ return localStorage.getItem('dcr_'+key); }catch(e){ return null; }
 }
 
 async function storageSet(key, value){
-  if(KV_ENABLED){
-    try{ return await kvSet(key, value); }
-    catch(e){ console.warn('storageSet: Vercel KV write failed for', key, e); /* not available here, fall through */ }
+  if(GAS_ENABLED){
+    try{ return await gasSet(key, value); }
+    catch(e){ console.warn('storageSet: Google Sheet write failed for', key, e); /* not available here, fall through */ }
   }
   if(window.storage && typeof window.storage.set === 'function'){
     try{
@@ -3856,10 +3857,21 @@ async function loadAll(){
     rfis = v ? JSON.parse(v) : [];
   }catch(e){ rfis = []; }
 
+  // Seed demo data only once. IMPORTANT: persist the seed immediately.
+  // Previously the demo rows were created only in memory. On the next page
+  // load storage was still empty, so loadAll() created the same default rows
+  // again. Persisting them here makes the initial dataset a real saved state
+  // and, more importantly, means an empty storage backend is not repeatedly
+  // treated as a fresh database.
   if(docs.length===0 && trs.length===0 && rfis.length===0){
     docs = [{id:uid(),docNo:"CIV-DRG-0001",title:"Site Layout Plan - General Arrangement",discipline:"Civil",subDiscipline:"General",docType:"Drawing",revision:"P02",status:"A - Approved",originator:"ABC Contractors",dateIssued:"2026-03-10",reviewDue:"2026-03-24",remarks:"Issued for construction"}];
     trs = [{id:uid(),trNo:"TR-0001",dateSent:"2026-03-10",direction:"Outgoing",from:"ABC Contractors",to:"Client PM Team",purpose:"For Approval",relatedDocs:"CIV-DRG-0001",status:"N",dueResponse:"2026-03-24",remarks:"Response received ahead of schedule"}];
     rfis = [{id:uid(),rfiNo:"RFI-0001",subject:"Clarification on rebar spacing at Grid C-D",revision:"1",discipline:"Structural",raisedBy:"ABC Contractors",dateRaised:"2026-03-05",priority:"High",status:"Closed",dateRequired:"2026-03-12",remarks:"Closed on time"}];
+    await Promise.all([
+      storageSet(pKey('documents'), JSON.stringify(docs)),
+      storageSet(pKey('transmittals'), JSON.stringify(trs)),
+      storageSet(pKey('rfis'), JSON.stringify(rfis))
+    ]);
   }
 
   try{
